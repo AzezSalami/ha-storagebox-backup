@@ -5,11 +5,13 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import threading
 import time
 import urllib.request
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
@@ -343,6 +345,7 @@ class Job:
         self.ok = None
         self.summary = ""
         self.lines = []
+        self.out = ""  # full output of the most recent run()
 
     def log(self, msg):
         if len(self.lines) < 50000:
@@ -354,8 +357,11 @@ class Job:
             cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="replace",
         )
+        out = []
         for line in p.stdout:
             self.log(line)
+            out.append(line)
+        self.out = "".join(out)
         return p.wait()
 
     def public(self):
@@ -404,22 +410,116 @@ def not_ready(job):
     return False, "Not configured"
 
 
+# (regex, status, plain-language explanation); first match wins, so specific rules come first.
+HINTS = [
+    (r"REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed", "fail",
+     "The server's host key differs from the one saved earlier. If the server was reinstalled this is expected: "
+     "press 'Forget saved host key' (SSH key section) and test again."),
+    (r"Could not resolve hostname|Name or service not known|no such host|Temporary failure in name resolution|nodename nor servname", "fail",
+     "The host name cannot be resolved. Check its spelling and that Home Assistant has internet/DNS access."),
+    (r"timed out|i/o timeout", "fail",
+     "The server did not answer. Check the port, that SSH/SFTP is enabled at your provider, and that no firewall blocks it."),
+    (r"Connection refused", "fail",
+     "Nothing is listening on this port. Check the port number and that SSH/SFTP is enabled at your provider."),
+    (r"Permission denied \((publickey|password|keyboard)|Too many authentication failures|no supported authentication", "fail",
+     "The server rejected the SSH key. Install the public key (Settings > SSH key) and check the username."),
+    (r"sftp connections only|shell access is disabled", "warn",
+     "Shell commands are disabled on this account (normal for SFTP-only accounts). Backups can still work."),
+    (r"subsystem request failed", "fail",
+     "The server accepted the login but does not offer SFTP for this account. Ask your provider to enable SFTP."),
+    (r"wrong password or no key found|ciphertext verification failed", "fail",
+     "Wrong encryption passphrase for this repository."),
+    (r"InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied|Forbidden|\b40[13]\b|Unauthorized", "fail",
+     "The storage rejected the credentials. Check the access key, secret key and the key's permissions on the bucket."),
+    (r"NoSuchBucket", "fail", "The bucket does not exist. Check the bucket name, endpoint and region."),
+    (r"already locked|unable to create lock", "fail",
+     "Another backup holds a lock on the repository, or one crashed. Wait for it to finish, or remove stale locks with 'restic unlock'."),
+    (r"Is there a repository at the following location|unable to open config file|repository does not exist|file does not exist|no such file or directory", "warn",
+     "No repository exists at this location yet. If this is your first setup press 'Initialize repository'; otherwise check the folder path."),
+    (r"Permission denied", "fail",
+     "The account is not allowed to use this folder. Check the folder path and its permissions."),
+]
+
+
+def classify(text):
+    for rx, status, hint in HINTS:
+        if re.search(rx, text, re.I):
+            return status, hint
+    return None, ""
+
+
+def tail(text, n=4):
+    lines = [x for x in text.strip().splitlines() if x.strip()]
+    return "\n".join(lines[-n:])[:500]
+
+
+def net_target(s):
+    t = ptype(s)
+    if t == "sftp":
+        return s["host"], s["port"]
+    if t == "s3":
+        ep = s["s3_endpoint"]
+        u = urlparse(ep if "://" in ep else "https://" + ep)
+        return u.hostname, u.port or (80 if u.scheme == "http" else 443)
+    return None, None
+
+
 def job_test(job):
     s = load_settings()
+    steps = []
+
+    def step(name, status, detail="", hint=""):
+        steps.append({"name": name, "status": status, "detail": detail, "hint": hint})
+        job.log(f"[{status.upper()}] {name}" + (f": {detail}" if detail else "") + (f"\n    -> {hint}" if hint else ""))
+
+    def finish(summary):
+        update_state(lambda st: st.__setitem__("last_test", {"at": time.time(), "steps": steps}))
+        return all(x["status"] != "fail" for x in steps), summary
+
     if not configured(s):
-        return not_ready(job)
-    ssh_ok = True
+        step("Settings", "fail", "The destination or passphrase is incomplete",
+             "Fill in every field for this provider, set a passphrase and press Save.")
+        return finish("Not configured")
+
+    host, port = net_target(s)
+    if host:
+        try:
+            ips = sorted({a[4][0] for a in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
+            step("Find server", "ok", f"{host} -> {', '.join(ips[:3])}")
+        except OSError as e:
+            step("Find server", "fail", str(e), classify(str(e))[1] or "The host name cannot be resolved. Check its spelling.")
+            return finish("Host not found")
+        try:
+            socket.create_connection((host, port), timeout=8).close()
+            step("Open connection", "ok", f"port {port} is reachable")
+        except OSError as e:
+            step("Open connection", "fail", f"{host}:{port} - {e}",
+                 classify(str(e))[1] or "Could not connect. Check the port and your provider's firewall.")
+            return finish("Cannot reach server")
+
     if ptype(s) == "sftp":
-        job.log("Checking SSH login...")
-        ssh_ok = job.run(ssh_base(s) + [f"{s['user']}@{s['host']}", "ls"], os.environ.copy()) == 0
-        if not ssh_ok:
-            job.log("(SFTP-only accounts refuse shell commands; continuing with the repository check.)")
-    job.log("Checking repository...")
-    if job.run(restic(s, "cat", "config"), restic_env(s)) == 0:
-        return True, "Connection OK, repository found"
-    if ptype(s) == "sftp" and not ssh_ok:
-        return False, "Could not log in - check host, user, port and that the SSH key is installed"
-    return True, "Reachable, but no repository found (or wrong passphrase) - initialize it if this is new"
+        rc = job.run(ssh_base(s) + [f"{s['user']}@{s['host']}", "ls"], os.environ.copy())
+        status, hint = classify(job.out)
+        if rc == 0:
+            step("SSH login", "ok", "Logged in with the SSH key")
+        elif status == "fail":
+            step("SSH login", "fail", tail(job.out), hint)
+            return finish("SSH login failed")
+        else:
+            step("SSH login", "warn", tail(job.out),
+                 hint or "The shell login did not work; trying the SFTP repository check anyway.")
+
+    rc = job.run(restic(s, "cat", "config"), restic_env(s))
+    status, hint = classify(job.out)
+    if rc == 0:
+        step("Repository", "ok", "Repository found and passphrase accepted")
+        return finish("Connection OK, repository found")
+    if status == "warn":
+        step("Repository", "warn", tail(job.out), hint)
+        return finish("Reachable, but no repository yet - initialize it")
+    step("Repository", "fail", tail(job.out),
+         hint or "restic could not open the repository. See the detail above and the activity log.")
+    return finish("Repository check failed")
 
 
 def job_init(job):
@@ -554,8 +654,18 @@ def api_state():
         job=CURRENT.public() if CURRENT else None,
         history=st.get("history", [])[:15],
         next_run=next_run(s, st),
+        last_test=st.get("last_test"),
         restore_root=RESTORE_ROOT,
     )
+
+
+@app.post("/api/hostkey/reset")
+def api_hostkey_reset():
+    try:
+        os.remove(KNOWN_HOSTS)
+    except FileNotFoundError:
+        pass
+    return jsonify(ok=True)
 
 
 @app.get("/api/fs")
