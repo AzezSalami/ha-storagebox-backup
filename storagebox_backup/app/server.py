@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Storage Box Backup: BorgBackup of Home Assistant data to a Hetzner Storage Box."""
+"""Remote Backup: restic backups of Home Assistant data to SFTP, S3 or any restic backend."""
 import collections
 import json
 import os
@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("DATA_DIR", "/data")
 SSH_DIR = os.path.join(DATA, "ssh")
@@ -21,28 +21,65 @@ KEY = os.path.join(SSH_DIR, "id_ed25519")
 KNOWN_HOSTS = os.path.join(SSH_DIR, "known_hosts")
 SETTINGS_FILE = os.path.join(DATA, "settings.json")
 STATE_FILE = os.path.join(DATA, "state.json")
-RESTORE_ROOT = os.environ.get("RESTORE_ROOT", "/share/storagebox-restore")
+RESTORE_ROOT = os.environ.get("RESTORE_ROOT", "/share/remote-backup-restore")
 INGRESS_IP = "172.30.32.2"
 SOURCES = {"config": "/config", "ssl": "/ssl", "media": "/media", "backup": "/backup", "share": "/share"}
-ARCHIVE_RE = re.compile(r"[A-Za-z0-9._:-]+")
+SNAPSHOT_RE = re.compile(r"[0-9a-f]{8,64}")
+BLOCKED_ENV = {"PATH", "SUPERVISOR_TOKEN", "RESTIC_PASSWORD", "RESTIC_CACHE_DIR"}
+
+# Presets shown in the UI. "type" decides which settings fields apply.
+PROVIDERS = {
+    "hetzner": {
+        "label": "Hetzner Storage Box", "type": "sftp", "port": 23, "path": "ha-backup",
+        "host_hint": "u123456.your-storagebox.de", "user_hint": "u123456", "key_install": "hetzner",
+        "note": "Enable SSH support for the Storage Box in the Hetzner console first. SFTP uses port 23.",
+    },
+    "hostinger": {
+        "label": "Hostinger (web hosting or VPS)", "type": "sftp", "port": 65002, "path": "backups/homeassistant",
+        "host_hint": "Server IP shown in hPanel > SSH Access", "user_hint": "u123456789", "key_install": "shell",
+        "note": "Enable SSH access in hPanel. Web/cloud hosting uses port 65002, a VPS uses 22. "
+                "Backups count against your plan's disk quota.",
+    },
+    "sftp": {
+        "label": "Any SSH / SFTP server (VPS, NAS, ...)", "type": "sftp", "port": 22, "path": "ha-backup",
+        "host_hint": "server.example.com", "user_hint": "backup", "key_install": "shell",
+        "note": "Any server that offers SFTP. A path starting with / is absolute, otherwise it is relative to the login home.",
+    },
+    "s3": {
+        "label": "S3-compatible (AWS, Backblaze B2, Wasabi, MinIO, ...)", "type": "s3", "port": 0, "path": "ha-backup",
+        "note": "Endpoint example: s3.eu-central-003.backblazeb2.com or s3.amazonaws.com. Use an access key limited to this bucket.",
+    },
+    "custom": {
+        "label": "Advanced: any restic repository", "type": "custom", "port": 0, "path": "",
+        "note": "Enter a restic repository string (rest:, rclone:, azure:, gs:, b2:, ...) and its environment variables. "
+                "rclone is installed, so rclone: works with RCLONE_CONFIG_<NAME>_* variables.",
+    },
+}
 
 DEFAULTS = {
+    "provider": "hetzner",
     "host": "",
     "user": "",
     "port": 23,
-    "borg_remote": "borg-1.2",
-    "repo_dir": "ha-backup",
+    "path": "ha-backup",
+    "s3_endpoint": "",
+    "s3_bucket": "",
+    "s3_region": "",
+    "s3_access_key": "",
+    "s3_secret_key": "",
+    "repository": "",
+    "extra_env": "",
     "passphrase": "",
     "sources": ["config"],
     "excludes": [
-        "*/home-assistant_v2.db*",
+        "home-assistant_v2.db*",
         "*.log",
         "*.log.*",
-        "*/__pycache__",
-        "*/tts",
-        "*/deps",
+        "__pycache__",
+        "/config/tts",
+        "/config/deps",
     ],
-    "compression": "zstd,3",
+    "compression": "auto",
     "schedule": {"enabled": False, "mode": "daily", "time": "03:00", "every_hours": 24},
     "retention": {"daily": 7, "weekly": 4, "monthly": 6},
     "notify_failure": True,
@@ -73,6 +110,8 @@ def load_settings():
             s[k].update(v)
         else:
             s[k] = v
+    if s["provider"] not in PROVIDERS:
+        s["provider"] = "sftp"
     return s
 
 
@@ -80,6 +119,22 @@ def write_private(path, text):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(text)
+
+
+def parse_env(text):
+    env = {}
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, val = line.partition("=")
+        key = key.strip()
+        if not sep or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
+            raise ValueError(f"Bad environment line: {line.split('=')[0][:30]}")
+        if key in BLOCKED_ENV or key.startswith("LD_"):
+            raise ValueError(f"{key} cannot be set here")
+        env[key] = val.strip()
+    return env
 
 
 def clean_settings(p, cur):
@@ -91,18 +146,36 @@ def clean_settings(p, cur):
             raise ValueError(f"Invalid {label}")
         s[key] = v
 
+    s["provider"] = p.get("provider", s["provider"])
+    if s["provider"] not in PROVIDERS:
+        raise ValueError("Unknown provider")
     text("host", r"[A-Za-z0-9.-]+", "host")
     text("user", r"[A-Za-z0-9._-]+", "user")
-    text("borg_remote", r"[A-Za-z0-9._-]+", "Borg remote path")
-    text("repo_dir", r"[A-Za-z0-9._/-]+", "repository folder")
-    text("compression", r"[a-z0-9,]+", "compression")
-    if ".." in s["repo_dir"].split("/"):
-        raise ValueError("Invalid repository folder")
-    s["port"] = int(p.get("port", s["port"]))
-    if p.get("passphrase"):
-        s["passphrase"] = str(p["passphrase"])
+    text("path", r"[A-Za-z0-9._/-]+", "path")
+    if ".." in s["path"].split("/"):
+        raise ValueError("Invalid path")
+    s["port"] = int(p.get("port", s["port"]) or 0)
+    text("s3_endpoint", r"(https?://)?[A-Za-z0-9.:-]+", "S3 endpoint")
+    text("s3_bucket", r"[A-Za-z0-9._-]+", "S3 bucket")
+    text("s3_region", r"[A-Za-z0-9-]+", "S3 region")
+    text("s3_access_key", r"[A-Za-z0-9/+=_.-]+", "S3 access key")
+    text("repository", r"\S+", "repository")
+    if s["repository"].startswith("-"):
+        raise ValueError("Invalid repository")
+    if "extra_env" in p:
+        parse_env(p["extra_env"])
+        s["extra_env"] = str(p["extra_env"])
+    for secret in ("passphrase", "s3_secret_key"):
+        if p.get(secret):
+            s[secret] = str(p[secret])
+    if re.search(r"\s", s["s3_secret_key"]):
+        raise ValueError("Invalid S3 secret key")
+
     s["sources"] = [k for k in p.get("sources", s["sources"]) if k in SOURCES]
     s["excludes"] = [str(x).strip() for x in p.get("excludes", s["excludes"]) if str(x).strip()]
+    s["compression"] = p.get("compression", s["compression"])
+    if s["compression"] not in ("auto", "max", "off"):
+        raise ValueError("Invalid compression")
 
     sch = p.get("schedule", {})
     cs = s["schedule"]
@@ -141,17 +214,28 @@ def update_state(fn):
         write_private(STATE_FILE, json.dumps(st))
 
 
+def ptype(s):
+    return PROVIDERS[s["provider"]]["type"]
+
+
 def configured(s):
-    return bool(s["host"] and s["user"] and s["repo_dir"] and s["passphrase"])
+    if not s["passphrase"]:
+        return False
+    t = ptype(s)
+    if t == "sftp":
+        return bool(s["host"] and s["user"] and s["path"] and s["port"])
+    if t == "s3":
+        return bool(s["s3_endpoint"] and s["s3_bucket"] and s["s3_access_key"] and s["s3_secret_key"])
+    return bool(s["repository"])
 
 
-# ---------------------------------------------------------------- ssh / borg plumbing
+# ---------------------------------------------------------------- ssh / restic plumbing
 
 def ensure_key():
     os.makedirs(SSH_DIR, mode=0o700, exist_ok=True)
     if not os.path.exists(KEY):
         subprocess.run(
-            ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "ha-storagebox-backup", "-f", KEY],
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "ha-remote-backup", "-f", KEY],
             check=True, capture_output=True,
         )
 
@@ -167,37 +251,53 @@ def pubkey():
 def ssh_base(s):
     return [
         "ssh", "-p", str(s["port"]), "-i", KEY,
+        "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "-o", "ServerAliveInterval=30",
         "-o", "ConnectTimeout=15",
     ]
 
 
-def repo_url(s):
-    return f"ssh://{s['user']}@{s['host']}:{s['port']}/./{s['repo_dir']}"
+def repo_spec(s):
+    """Return (restic repository string, extra restic args, extra env)."""
+    t = ptype(s)
+    if t == "sftp":
+        target = f"{s['user']}@{s['host']}"
+        cmd = " ".join(shlex.quote(a) for a in ssh_base(s) + [target, "-s", "sftp"])
+        return f"sftp:{target}:{s['path']}", ["-o", f"sftp.command={cmd}"], {}
+    if t == "s3":
+        endpoint = s["s3_endpoint"].rstrip("/")
+        if not endpoint.startswith(("http://", "https://")):
+            endpoint = "https://" + endpoint
+        repo = f"s3:{endpoint}/{s['s3_bucket']}"
+        if s["path"]:
+            repo += "/" + s["path"].strip("/")
+        env = {"AWS_ACCESS_KEY_ID": s["s3_access_key"], "AWS_SECRET_ACCESS_KEY": s["s3_secret_key"]}
+        if s["s3_region"]:
+            env["AWS_DEFAULT_REGION"] = s["s3_region"]
+        return repo, [], env
+    return s["repository"], [], parse_env(s["extra_env"])
 
 
-def borg_env(s):
+def restic(s, *args):
+    repo, extra, _ = repo_spec(s)
+    return ["restic", "-r", repo, *extra, *args]
+
+
+def restic_env(s):
     env = os.environ.copy()
-    env["BORG_PASSPHRASE"] = s["passphrase"]
-    env["BORG_BASE_DIR"] = os.path.join(DATA, "borg")
-    env["BORG_RSH"] = " ".join(shlex.quote(a) for a in ssh_base(s)[:1] + [
-        "-i", KEY, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "ServerAliveInterval=30",
-    ])
-    env["BORG_RELOCATED_REPO_ACCESS_IS_OK"] = "yes"
+    env.update(repo_spec(s)[2])
+    env["RESTIC_PASSWORD"] = s["passphrase"]
+    env["RESTIC_CACHE_DIR"] = os.path.join(DATA, "restic-cache")
     return env
-
-
-def borg(s, *args):
-    return ["borg", "--remote-path", s["borg_remote"], *args]
 
 
 def notify(title, message):
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
         return
-    body = json.dumps({"title": title, "message": message, "notification_id": "storagebox_backup"})
+    body = json.dumps({"title": title, "message": message, "notification_id": "remote_backup"})
     req = urllib.request.Request(
         "http://supervisor/core/api/services/persistent_notification/create",
         data=body.encode(),
@@ -210,6 +310,9 @@ def notify(title, message):
 
 
 # ---------------------------------------------------------------- jobs
+
+CRED_RE = re.compile(r"(://[^:/@\s]+):[^@\s]+@")
+
 
 class Job:
     def __init__(self, kind, trigger):
@@ -227,7 +330,7 @@ class Job:
             self.lines.append(str(msg).rstrip("\r\n"))
 
     def run(self, cmd, env, cwd=None):
-        self.log("$ " + " ".join(shlex.quote(c) for c in cmd))
+        self.log(CRED_RE.sub(r"\1:***@", "$ " + " ".join(shlex.quote(c) for c in cmd)))
         p = subprocess.Popen(
             cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="replace",
@@ -272,13 +375,13 @@ def run_job(job, fn):
 
     update_state(add)
     if not ok and job.kind == "backup" and load_settings()["notify_failure"]:
-        notify("Storage Box backup failed", summary)
+        notify("Remote backup failed", summary)
     LAST, CURRENT = job, None
     RUN_LOCK.release()
 
 
 def not_ready(job):
-    job.log("Fill in host, user, repository folder and passphrase in Settings first.")
+    job.log("Finish the destination settings and set a passphrase first.")
     return False, "Not configured"
 
 
@@ -286,25 +389,26 @@ def job_test(job):
     s = load_settings()
     if not configured(s):
         return not_ready(job)
-    job.log("Checking SSH login...")
-    rc = job.run(ssh_base(s) + ["-o", "BatchMode=yes", f"{s['user']}@{s['host']}", "ls"], os.environ.copy())
-    if rc != 0:
-        return False, "SSH login failed - install the public key first (Settings > SSH key)"
-    job.log("Checking Borg repository...")
-    rc = job.run(borg(s, "info", repo_url(s)), borg_env(s))
-    if rc == 0:
+    ssh_ok = True
+    if ptype(s) == "sftp":
+        job.log("Checking SSH login...")
+        ssh_ok = job.run(ssh_base(s) + [f"{s['user']}@{s['host']}", "ls"], os.environ.copy()) == 0
+        if not ssh_ok:
+            job.log("(SFTP-only accounts refuse shell commands; continuing with the repository check.)")
+    job.log("Checking repository...")
+    if job.run(restic(s, "cat", "config"), restic_env(s)) == 0:
         return True, "Connection OK, repository found"
-    return True, "SSH works, but no usable repository - initialize it, or check the passphrase"
+    if ptype(s) == "sftp" and not ssh_ok:
+        return False, "Could not log in - check host, user, port and that the SSH key is installed"
+    return True, "Reachable, but no repository found (or wrong passphrase) - initialize it if this is new"
 
 
 def job_init(job):
     s = load_settings()
     if not configured(s):
         return not_ready(job)
-    rc = job.run(borg(s, "init", "--encryption=repokey-blake2", repo_url(s)), borg_env(s))
-    if rc == 0:
-        return True, "Repository initialized"
-    return False, f"borg init failed (exit {rc})"
+    rc = job.run(restic(s, "init", "--repository-version", "2"), restic_env(s))
+    return rc == 0, "Repository initialized" if rc == 0 else f"restic init failed (exit {rc})"
 
 
 def prune(job, s):
@@ -316,11 +420,9 @@ def prune(job, s):
     if not keep:
         job.log("Retention disabled; skipping prune.")
         return 0
-    env = borg_env(s)
-    rc = job.run(borg(s, "prune", "--list", "--glob-archives", "ha-*", *keep, repo_url(s)), env)
-    if rc <= 1:
-        job.run(borg(s, "compact", repo_url(s)), env)  # best effort, needs borg >= 1.2
-    return rc
+    cmd = restic(s, "forget", "--prune", "--tag", "homeassistant", "--host", "homeassistant",
+                 "--group-by", "host,tags", *keep)
+    return job.run(cmd, restic_env(s))
 
 
 def job_backup(job):
@@ -331,20 +433,17 @@ def job_backup(job):
     if not srcs:
         job.log("No backup sources selected (or none are mounted).")
         return False, "No sources selected"
-    name = datetime.now().strftime("ha-%Y-%m-%d_%H-%M")
-    cmd = borg(s, "create", "--stats", "--compression", s["compression"],
-               "--exclude-caches", "--exclude", RESTORE_ROOT)
+    cmd = restic(s, "backup", "--tag", "homeassistant", "--host", "homeassistant",
+                 "--compression", s["compression"], "--exclude-caches", "--exclude", RESTORE_ROOT)
     for pat in s["excludes"]:
         cmd += ["--exclude", pat]
-    cmd += [f"{repo_url(s)}::{name}", *srcs]
-    rc = job.run(cmd, borg_env(s))
-    if rc > 1:
-        return False, f"borg create failed (exit {rc})"
-    summary = f"Created {name}" + (" (with warnings)" if rc == 1 else "")
+    rc = job.run(cmd + srcs, restic_env(s))
+    if rc not in (0, 3):  # 3 = snapshot created but some files unreadable
+        return False, f"restic backup failed (exit {rc})"
+    summary = "Snapshot created" + (" (some files unreadable)" if rc == 3 else "")
     job.log("Pruning old snapshots...")
-    if prune(job, s) > 1:
-        summary += "; prune failed"
-        return False, summary
+    if prune(job, s) != 0:
+        return False, summary + "; prune failed"
     return True, summary
 
 
@@ -353,31 +452,31 @@ def job_prune(job):
     if not configured(s):
         return not_ready(job)
     rc = prune(job, s)
-    return rc <= 1, "Pruned old snapshots" if rc <= 1 else f"borg prune failed (exit {rc})"
+    return rc == 0, "Pruned old snapshots" if rc == 0 else f"restic forget failed (exit {rc})"
 
 
-def make_restore(archive, paths):
+def make_restore(snap, paths):
     def fn(job):
         s = load_settings()
         if not configured(s):
             return not_ready(job)
-        dest = os.path.join(RESTORE_ROOT, archive)
+        dest = os.path.join(RESTORE_ROOT, snap)
         os.makedirs(dest, exist_ok=True)
-        cmd = borg(s, "extract", "--list", f"{repo_url(s)}::{archive}", *paths)
-        rc = job.run(cmd, borg_env(s), cwd=dest)
-        if rc > 1:
-            return False, f"borg extract failed (exit {rc})"
-        return True, f"Restored to {dest}"
+        cmd = restic(s, "restore", snap, "--target", dest)
+        for p in paths:
+            cmd += ["--include", "/" + p]
+        rc = job.run(cmd, restic_env(s))
+        return rc == 0, f"Restored to {dest}" if rc == 0 else f"restic restore failed (exit {rc})"
     return fn
 
 
-def make_delete(archive):
+def make_delete(snap):
     def fn(job):
         s = load_settings()
         if not configured(s):
             return not_ready(job)
-        rc = job.run(borg(s, "delete", f"{repo_url(s)}::{archive}"), borg_env(s))
-        return rc <= 1, f"Deleted {archive}" if rc <= 1 else f"borg delete failed (exit {rc})"
+        rc = job.run(restic(s, "forget", "--prune", snap), restic_env(s))
+        return rc == 0, f"Deleted {snap}" if rc == 0 else f"restic forget failed (exit {rc})"
     return fn
 
 
@@ -422,10 +521,12 @@ def index():
 def api_state():
     s = load_settings()
     st = load_state()
-    safe = dict(s, passphrase="", passphrase_set=bool(s["passphrase"]))
+    safe = dict(s, passphrase="", s3_secret_key="",
+                passphrase_set=bool(s["passphrase"]), s3_secret_set=bool(s["s3_secret_key"]))
     return jsonify(
         version=VERSION,
         settings=safe,
+        providers=PROVIDERS,
         configured=configured(s),
         pubkey=pubkey(),
         job=CURRENT.public() if CURRENT else None,
@@ -458,6 +559,8 @@ def api_settings():
     except (ValueError, TypeError) as e:
         return jsonify(error=str(e)), 400
     write_private(SETTINGS_FILE, json.dumps(s))
+    REPO_CACHE["data"] = None
+    TREE["archive"] = None
     return jsonify(ok=True)
 
 
@@ -465,21 +568,27 @@ def api_settings():
 def api_key_install():
     s = load_settings()
     pw = (request.get_json(force=True) or {}).get("password", "")
+    if ptype(s) != "sftp":
+        return jsonify(error="SSH keys only apply to SFTP destinations"), 400
     if not (s["host"] and s["user"]):
-        return jsonify(error="Save host and user in Settings first"), 400
+        return jsonify(error="Save host and user first"), 400
     if not pw:
-        return jsonify(error="Enter the Storage Box password"), 400
+        return jsonify(error="Enter the account password"), 400
+    if PROVIDERS[s["provider"]]["key_install"] == "hetzner":
+        remote = "install-ssh-key"
+    else:
+        remote = "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys"
     env = os.environ.copy()
     env["SSHPASS"] = pw
     cmd = ["sshpass", "-e", "ssh", "-p", str(s["port"]),
            "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
            "-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
-           f"{s['user']}@{s['host']}", "install-ssh-key"]
+           f"{s['user']}@{s['host']}", remote]
     try:
         with open(KEY + ".pub") as pub:
             r = subprocess.run(cmd, stdin=pub, env=env, capture_output=True, text=True, timeout=45)
     except subprocess.TimeoutExpired:
-        return jsonify(error="Timed out. Is SSH support enabled on the Storage Box?"), 500
+        return jsonify(error="Timed out. Is SSH access enabled on the server?"), 500
     out = (r.stdout + r.stderr).strip()
     if r.returncode != 0:
         return jsonify(error=out or f"ssh exited with {r.returncode}"), 500
@@ -507,20 +616,22 @@ def api_repo():
         return jsonify(ready=False)
     if not request.args.get("refresh") and REPO_CACHE["data"] and time.time() - REPO_CACHE["at"] < 60:
         return jsonify(REPO_CACHE["data"])
-    env, url = borg_env(s), repo_url(s)
+    env = restic_env(s)
     try:
-        r = subprocess.run(borg(s, "list", "--json", url), env=env, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(restic(s, "snapshots", "--json"), env=env, capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             return jsonify(ready=True, error=r.stderr.strip()[-600:])
-        archives = [{"name": a["name"], "start": a["start"]} for a in json.loads(r.stdout)["archives"]]
-        archives.sort(key=lambda a: a["start"], reverse=True)
+        snaps = [{"id": x["short_id"], "time": x["time"], "paths": x.get("paths", [])}
+                 for x in json.loads(r.stdout or "[]") or []]
+        snaps.sort(key=lambda x: x["time"], reverse=True)
         size = None
-        r = subprocess.run(borg(s, "info", "--json", url), env=env, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(restic(s, "stats", "--mode", "raw-data", "--json"), env=env,
+                           capture_output=True, text=True, timeout=120)
         if r.returncode == 0:
-            size = json.loads(r.stdout).get("cache", {}).get("stats", {}).get("unique_csize")
+            size = json.loads(r.stdout).get("total_size")
     except (subprocess.TimeoutExpired, ValueError, KeyError) as e:
         return jsonify(ready=True, error=f"Could not read repository: {e}")
-    data = {"ready": True, "archives": archives, "size": size}
+    data = {"ready": True, "snapshots": snaps, "size": size}
     REPO_CACHE.update(at=time.time(), data=data)
     return jsonify(data)
 
@@ -528,41 +639,44 @@ def api_repo():
 TREE = {"archive": None, "children": {}}
 
 
-def load_tree(s, archive):
+def load_tree(s, snap):
     children = collections.defaultdict(dict)
     p = subprocess.Popen(
-        borg(s, "list", "--format", "{type}{path}{NL}", f"{repo_url(s)}::{archive}"),
-        env=borg_env(s), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace",
+        restic(s, "ls", "--json", snap), env=restic_env(s),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace",
     )
     for line in p.stdout:
-        line = line.rstrip("\n")
-        if len(line) < 2:
+        try:
+            node = json.loads(line)
+        except ValueError:
             continue
-        kind, path = line[0], line[1:]
-        parts = path.split("/")
+        if node.get("struct_type") != "node":
+            continue
+        parts = node["path"].strip("/").split("/")
+        is_dir = node.get("type") == "dir"
         for i, name in enumerate(parts):
             parent = "/".join(parts[:i])
-            if i < len(parts) - 1 or kind == "d":
+            if i < len(parts) - 1 or is_dir:
                 children[parent][name] = "d"
             else:
                 children[parent].setdefault(name, "f")
     if p.wait() != 0:
-        raise RuntimeError("borg list failed")
-    TREE.update(archive=archive, children=children)
+        raise RuntimeError("restic ls failed")
+    TREE.update(archive=snap, children=children)
 
 
 @app.get("/api/browse")
 def api_browse():
-    archive = request.args.get("archive", "")
+    snap = request.args.get("archive", "")
     path = request.args.get("path", "").strip("/")
-    if not ARCHIVE_RE.fullmatch(archive):
-        return jsonify(error="Bad archive name"), 400
+    if not SNAPSHOT_RE.fullmatch(snap):
+        return jsonify(error="Bad snapshot id"), 400
     s = load_settings()
     if not configured(s):
         return jsonify(error="Not configured"), 400
-    if TREE["archive"] != archive:
+    if TREE["archive"] != snap:
         try:
-            load_tree(s, archive)
+            load_tree(s, snap)
         except RuntimeError as e:
             return jsonify(error=str(e)), 500
     entries = [{"name": n, "type": t} for n, t in TREE["children"].get(path, {}).items()]
@@ -573,38 +687,26 @@ def api_browse():
 @app.post("/api/restore")
 def api_restore():
     body = request.get_json(force=True) or {}
-    archive, paths = body.get("archive", ""), body.get("paths", [])
-    if not ARCHIVE_RE.fullmatch(archive) or not paths:
-        return jsonify(error="Pick an archive and at least one path"), 400
+    snap, paths = body.get("archive", ""), body.get("paths", [])
+    if not SNAPSHOT_RE.fullmatch(snap) or not paths:
+        return jsonify(error="Pick a snapshot and at least one path"), 400
     for p in paths:
-        if not isinstance(p, str) or p.startswith(("/", "-")) or ".." in p.split("/"):
+        if not isinstance(p, str) or p.startswith("/") or ".." in p.split("/"):
             return jsonify(error=f"Bad path: {p}"), 400
-    if not start_job("restore", make_restore(archive, paths)):
+    if not start_job("restore", make_restore(snap, paths)):
         return jsonify(error="Another job is already running"), 409
     return jsonify(ok=True)
 
 
 @app.post("/api/delete")
 def api_delete():
-    archive = (request.get_json(force=True) or {}).get("archive", "")
-    if not ARCHIVE_RE.fullmatch(archive):
-        return jsonify(error="Bad archive name"), 400
-    if not start_job("delete", make_delete(archive)):
+    snap = (request.get_json(force=True) or {}).get("archive", "")
+    if not SNAPSHOT_RE.fullmatch(snap):
+        return jsonify(error="Bad snapshot id"), 400
+    if not start_job("delete", make_delete(snap)):
         return jsonify(error="Another job is already running"), 409
     REPO_CACHE["data"] = None
     return jsonify(ok=True)
-
-
-@app.get("/api/key/export")
-def api_key_export():
-    s = load_settings()
-    if not configured(s):
-        return jsonify(error="Not configured"), 400
-    r = subprocess.run(borg(s, "key", "export", repo_url(s), "-"), env=borg_env(s),
-                       capture_output=True, text=True, timeout=60)
-    if r.returncode != 0:
-        return jsonify(error=r.stderr.strip()[-400:]), 500
-    return jsonify(key=r.stdout)
 
 
 if __name__ == "__main__":
