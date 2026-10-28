@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage Box Backup</title>
+<style>
+:root {
+  --bg: #f4f5f7; --card: #fff; --text: #1c1e21; --muted: #6b7280; --line: #e3e5e8;
+  --accent: #03a9f4; --accent-text: #fff; --ok: #2e9e5b; --bad: #d64545; --warn: #d98a00; --log: #111827; --log-text: #d1d5db;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111318; --card: #1c1f26; --text: #e5e7eb; --muted: #9ca3af; --line: #2d313a; --log: #0b0d11; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, sans-serif; }
+main { max-width: 900px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 12px; }
+header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; gap: 8px; flex-wrap: wrap; }
+nav { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+nav button { background: none; border: 0; padding: 8px 14px; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; font: inherit; }
+nav button.active { color: var(--accent); border-color: var(--accent); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 14px; }
+.grid .card { margin: 0; }
+.stat .label { color: var(--muted); font-size: 12px; }
+.stat .value { font-size: 17px; font-weight: 600; margin-top: 2px; overflow-wrap: anywhere; }
+button.btn { background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; cursor: pointer; font: inherit; }
+button.btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+button.btn.danger { color: var(--bad); }
+button.btn:disabled { opacity: .5; cursor: not-allowed; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
+input[type=text], input[type=password], input[type=number], input[type=time], select, textarea {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit;
+}
+textarea { font-family: ui-monospace, monospace; font-size: 12px; }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0 12px; }
+.check { display: flex; align-items: center; gap: 8px; margin: 6px 0; color: var(--text); font-size: 14px; }
+.hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; border: 1px solid var(--line); background: var(--card); }
+.banner.run { border-color: var(--accent); }
+.banner.warn { border-color: var(--warn); }
+pre#log { background: var(--log); color: var(--log-text); padding: 12px; border-radius: 8px; max-height: 320px; overflow: auto; margin: 0; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; color: #fff; }
+.pill.ok { background: var(--ok); } .pill.bad { background: var(--bad); }
+.entry { display: flex; gap: 8px; align-items: center; padding: 5px 4px; border-bottom: 1px solid var(--line); }
+.entry a { cursor: pointer; color: var(--accent); }
+.crumbs { margin-bottom: 8px; font-size: 13px; }
+.crumbs a { color: var(--accent); cursor: pointer; }
+.hidden { display: none; }
+.toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 8px; z-index: 9; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Storage Box Backup</h1>
+    <span class="hint" id="version"></span>
+  </header>
+  <nav>
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="snapshots">Snapshots</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+
+  <!-- OVERVIEW -->
+  <section id="tab-overview">
+    <div class="banner warn hidden" id="setup-banner">Setup not finished. Open <b>Settings</b>, fill in your Storage Box, install the SSH key and initialize the repository.</div>
+    <div class="banner run hidden" id="run-banner"></div>
+    <div class="grid">
+      <div class="card stat"><div class="label">Last backup</div><div class="value" id="s-last">-</div></div>
+      <div class="card stat"><div class="label">Next scheduled</div><div class="value" id="s-next">-</div></div>
+      <div class="card stat"><div class="label">Snapshots</div><div class="value" id="s-count">-</div></div>
+      <div class="card stat"><div class="label">Repository size</div><div class="value" id="s-size">-</div></div>
+    </div>
+    <div class="card">
+      <div class="row">
+        <button class="btn primary" data-job="backup">Back up now</button>
+        <button class="btn" data-job="prune">Prune old snapshots</button>
+        <button class="btn" data-job="test">Test connection</button>
+      </div>
+    </div>
+    <div class="card"><h2>Activity log</h2><pre id="log">Nothing has run yet.</pre></div>
+    <div class="card"><h2>History</h2>
+      <table><thead><tr><th>When</th><th>Job</th><th>Result</th><th>Details</th></tr></thead><tbody id="history"></tbody></table>
+    </div>
+  </section>
+
+  <!-- SNAPSHOTS -->
+  <section id="tab-snapshots" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between"><h2 style="margin:0">Snapshots</h2><button class="btn" id="refresh-repo">Refresh</button></div>
+      <div id="repo-error" class="hint"></div>
+      <table><thead><tr><th>Name</th><th>Created</th><th></th></tr></thead><tbody id="archives"></tbody></table>
+    </div>
+    <div class="card hidden" id="browser">
+      <h2 id="browse-title"></h2>
+      <div class="crumbs" id="crumbs"></div>
+      <div id="entries"></div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn primary" id="restore-btn">Restore selected</button>
+        <span class="hint" id="restore-hint"></span>
+      </div>
+      <div class="hint">Files are restored to <code id="restore-root"></code> (reachable through the Samba share). Your live config is never overwritten.</div>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="tab-settings" class="hidden">
+    <div class="card">
+      <h2>1. Storage Box</h2>
+      <div class="cols">
+        <div><label>Host</label><input type="text" id="f-host" placeholder="u123456.your-storagebox.de"></div>
+        <div><label>Username</label><input type="text" id="f-user" placeholder="u123456"></div>
+        <div><label>SSH port</label><input type="number" id="f-port"></div>
+        <div><label>Repository folder</label><input type="text" id="f-repo_dir"></div>
+        <div><label>Borg path on server</label><input type="text" id="f-borg_remote"></div>
+      </div>
+      <div class="hint">Enable <b>SSH support</b> for the Storage Box in the Hetzner console first. Use <code>borg-1.2</code> (or a newer version Hetzner lists).</div>
+    </div>
+
+    <div class="card">
+      <h2>2. SSH key</h2>
+      <label>Public key (generated by this add-on)</label>
+      <textarea id="pubkey" rows="3" readonly></textarea>
+      <div class="row" style="margin-top:8px"><button class="btn" id="copy-key">Copy</button></div>
+      <label>Install it automatically (Storage Box password, used once, not stored)</label>
+      <div class="row"><input type="password" id="f-sbpass" style="flex:1" autocomplete="off"><button class="btn" id="install-key">Install key</button></div>
+      <div class="hint">Save host and username first. Or paste the key into the Storage Box's SSH keys in the Hetzner console.</div>
+    </div>
+
+    <div class="card">
+      <h2>3. Encryption passphrase</h2>
+      <input type="password" id="f-passphrase" autocomplete="new-password">
+      <div class="hint" id="pass-hint"></div>
+      <div class="hint"><b>Store this passphrase somewhere safe (e.g. a password manager).</b> Without it your backups cannot be restored.</div>
+      <div class="row" style="margin-top:8px"><button class="btn" id="export-key">Show repository key</button></div>
+      <textarea id="exported-key" rows="6" class="hidden" readonly></textarea>
+    </div>
+
+    <div class="card">
+      <h2>4. What to back up</h2>
+      <div id="sources"></div>
+      <label>Exclude patterns (one per line)</label>
+      <textarea id="f-excludes" rows="6"></textarea>
+      <div class="hint">The Home Assistant database is excluded by default: it is large, constantly changing and may be inconsistent while running. Remove the first line to include it.</div>
+      <label>Compression</label>
+      <select id="f-compression"><option>zstd,3</option><option>zstd,10</option><option>lz4</option><option>zlib,6</option><option>none</option></select>
+    </div>
+
+    <div class="card">
+      <h2>5. Schedule and retention</h2>
+      <label class="check"><input type="checkbox" id="f-sch-enabled"> Run backups automatically</label>
+      <div class="cols">
+        <div><label>Mode</label><select id="f-sch-mode"><option value="daily">Daily at a fixed time</option><option value="interval">Every N hours</option></select></div>
+        <div id="w-time"><label>Time</label><input type="time" id="f-sch-time"></div>
+        <div id="w-hours"><label>Every (hours)</label><input type="number" id="f-sch-hours" min="1"></div>
+      </div>
+      <div class="cols">
+        <div><label>Keep daily</label><input type="number" id="f-ret-daily" min="0"></div>
+        <div><label>Keep weekly</label><input type="number" id="f-ret-weekly" min="0"></div>
+        <div><label>Keep monthly</label><input type="number" id="f-ret-monthly" min="0"></div>
+      </div>
+      <label class="check" style="margin-top:12px"><input type="checkbox" id="f-notify"> Create a Home Assistant notification when a scheduled backup fails</label>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <button class="btn primary" id="save">Save settings</button>
+        <button class="btn" data-job="test">Test connection</button>
+        <button class="btn" data-job="init">Initialize repository</button>
+      </div>
+      <div class="hint">Initialize only once, after the connection test shows SSH works. It creates the encrypted repository.</div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+function h(tag, props = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k in e && k !== 'type') e[k] = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) e.append(c instanceof Node ? c : document.createTextNode(c ?? ''));
+  return e;
+}
+async function api(path, body) {
+  const opts = body !== undefined ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {};
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function toast(msg) {
+  const t = h('div', { class: 'toast' }, msg);
+  document.body.append(t);
+  setTimeout(() => t.remove(), 3500);
+}
+const fmtTime = (ts) => ts ? new Date(ts * 1000).toLocaleString() : '-';
+const fmtSize = (n) => {
+  if (n == null) return '-';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+};
+
+let STATE = null, formLoaded = false, repoLoaded = false;
+
+// ---- tabs
+document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => showTab(b.dataset.tab)));
+function showTab(name) {
+  document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('main > section').forEach((s) => s.classList.toggle('hidden', s.id !== 'tab-' + name));
+  if (name === 'snapshots') loadRepo();
+}
+
+// ---- jobs
+document.querySelectorAll('[data-job]').forEach((b) => b.addEventListener('click', async () => {
+  try {
+    await api('api/job/' + b.dataset.job, {});
+    showTab('overview');
+    poll();
+  } catch (e) { toast(e.message); }
+}));
+
+// ---- state
+async function loadState() {
+  STATE = await api('api/state');
+  const s = STATE;
+  $('#version').textContent = 'v' + s.version;
+  $('#setup-banner').classList.toggle('hidden', s.configured);
+  const rb = $('#run-banner');
+  rb.classList.toggle('hidden', !s.job);
+  if (s.job) rb.textContent = `Running: ${s.job.kind}${s.job.trigger === 'schedule' ? ' (scheduled)' : ''}...`;
+  document.querySelectorAll('button[data-job], #restore-btn, #install-key').forEach((b) => b.disabled = !!s.job);
+  const lastBackup = s.history.find((x) => x.kind === 'backup' && x.ok);
+  $('#s-last').textContent = lastBackup ? fmtTime(lastBackup.end) : 'never';
+  $('#s-next').textContent = s.next_run ? fmtTime(s.next_run) : 'off';
+  const tb = $('#history');
+  tb.replaceChildren(...s.history.map((x) => h('tr', {},
+    h('td', {}, fmtTime(x.start)), h('td', {}, x.kind + (x.trigger === 'schedule' ? ' (sched)' : '')),
+    h('td', {}, x.ok == null ? '' : h('span', { class: 'pill ' + (x.ok ? 'ok' : 'bad') }, x.ok ? 'OK' : 'Failed')),
+    h('td', {}, x.summary))));
+  $('#restore-root').textContent = s.restore_root;
+  if (!formLoaded) fillForm();
+  if (!s.job && !repoLoaded) { repoLoaded = true; loadRepo(); }
+}
+
+// ---- log
+let logJob = null, logNext = 0, lastRunning = false;
+async function loadLog() {
+  const d = await api(`api/log?since=${logNext}&job=${logJob || ''}`);
+  const el = $('#log');
+  if (d.job_id && d.job_id !== logJob) { el.textContent = ''; logJob = d.job_id; }
+  if (d.lines.length) {
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    el.textContent += d.lines.join('\n') + '\n';
+    if (near) el.scrollTop = el.scrollHeight;
+  }
+  logNext = d.next;
+  if (lastRunning && !d.running) loadRepo(true);
+  lastRunning = d.running;
+}
+async function poll() { try { await Promise.all([loadState(), loadLog()]); } catch (e) { /* transient */ } }
+setInterval(poll, 2000);
+
+// ---- settings form
+const SRC_LABELS = { config: 'Home Assistant config (/config)', ssl: 'SSL certificates (/ssl)', media: 'Media (/media)', backup: 'Home Assistant backups (/backup)', share: 'Share (/share)' };
+function fillForm() {
+  const s = STATE.settings;
+  formLoaded = true;
+  for (const k of ['host', 'user', 'port', 'repo_dir', 'borg_remote']) $('#f-' + k).value = s[k];
+  $('#f-excludes').value = s.excludes.join('\n');
+  $('#f-compression').value = s.compression;
+  $('#f-sch-enabled').checked = s.schedule.enabled;
+  $('#f-sch-mode').value = s.schedule.mode;
+  $('#f-sch-time').value = s.schedule.time;
+  $('#f-sch-hours').value = s.schedule.every_hours;
+  for (const k of ['daily', 'weekly', 'monthly']) $('#f-ret-' + k).value = s.retention[k];
+  $('#f-notify').checked = s.notify_failure;
+  $('#pubkey').value = STATE.pubkey;
+  $('#pass-hint').textContent = s.passphrase_set ? 'A passphrase is saved. Leave empty to keep it.' : 'No passphrase set yet.';
+  $('#sources').replaceChildren(...Object.keys(SRC_LABELS).map((k) => h('label', { class: 'check' },
+    h('input', { type: 'checkbox', id: 'src-' + k, checked: s.sources.includes(k), disabled: !STATE.sources[k] }),
+    SRC_LABELS[k] + (STATE.sources[k] ? '' : ' - not mounted'))));
+  syncMode();
+}
+function syncMode() {
+  const daily = $('#f-sch-mode').value === 'daily';
+  $('#w-time').classList.toggle('hidden', !daily);
+  $('#w-hours').classList.toggle('hidden', daily);
+}
+$('#f-sch-mode').addEventListener('change', syncMode);
+
+$('#save').addEventListener('click', async () => {
+  const body = {
+    host: $('#f-host').value, user: $('#f-user').value, port: $('#f-port').value,
+    repo_dir: $('#f-repo_dir').value, borg_remote: $('#f-borg_remote').value,
+    sources: Object.keys(SRC_LABELS).filter((k) => $('#src-' + k)?.checked),
+    excludes: $('#f-excludes').value.split('\n'),
+    compression: $('#f-compression').value,
+    schedule: { enabled: $('#f-sch-enabled').checked, mode: $('#f-sch-mode').value, time: $('#f-sch-time').value, every_hours: $('#f-sch-hours').value },
+    retention: { daily: $('#f-ret-daily').value, weekly: $('#f-ret-weekly').value, monthly: $('#f-ret-monthly').value },
+    notify_failure: $('#f-notify').checked,
+  };
+  const pass = $('#f-passphrase').value;
+  if (pass) body.passphrase = pass;
+  try {
+    await api('api/settings', body);
+    $('#f-passphrase').value = '';
+    formLoaded = false;
+    await loadState();
+    toast('Settings saved');
+  } catch (e) { toast(e.message); }
+});
+
+$('#copy-key').addEventListener('click', async () => {
+  const ta = $('#pubkey');
+  ta.select();
+  try { await navigator.clipboard.writeText(ta.value); toast('Copied'); } catch { document.execCommand('copy'); toast('Copied'); }
+});
+$('#install-key').addEventListener('click', async () => {
+  try {
+    const r = await api('api/key/install', { password: $('#f-sbpass').value });
+    $('#f-sbpass').value = '';
+    toast(r.output || 'Key installed');
+  } catch (e) { toast(e.message); }
+});
+$('#export-key').addEventListener('click', async () => {
+  try {
+    const r = await api('api/key/export');
+    const ta = $('#exported-key');
+    ta.value = r.key;
+    ta.classList.remove('hidden');
+  } catch (e) { toast(e.message); }
+});
+
+// ---- snapshots
+async function loadRepo(refresh) {
+  try {
+    const d = await api('api/repo' + (refresh ? '?refresh=1' : ''));
+    $('#repo-error').textContent = d.error || (d.ready ? '' : 'Not configured yet.');
+    const list = d.archives || [];
+    $('#s-count').textContent = d.ready && !d.error ? list.length : '-';
+    $('#s-size').textContent = fmtSize(d.size);
+    $('#archives').replaceChildren(...list.map((a) => h('tr', {},
+      h('td', {}, a.name), h('td', {}, a.start.replace('T', ' ').slice(0, 19)),
+      h('td', { style: 'text-align:right;white-space:nowrap' },
+        h('button', { class: 'btn', onclick: () => openBrowser(a.name) }, 'Browse'), ' ',
+        h('button', { class: 'btn danger', onclick: () => delArchive(a.name) }, 'Delete')))));
+  } catch (e) { $('#repo-error').textContent = e.message; }
+}
+$('#refresh-repo').addEventListener('click', () => loadRepo(true));
+async function delArchive(name) {
+  if (!confirm(`Permanently delete snapshot ${name}?`)) return;
+  try { await api('api/delete', { archive: name }); showTab('overview'); poll(); } catch (e) { toast(e.message); }
+}
+
+let B = { archive: null, path: '', selected: new Set() };
+async function openBrowser(name) {
+  B = { archive: name, path: '', selected: new Set() };
+  $('#browser').classList.remove('hidden');
+  $('#browse-title').textContent = 'Browse ' + name;
+  await browse('');
+  $('#browser').scrollIntoView();
+}
+async function browse(path) {
+  try {
+    const d = await api(`api/browse?archive=${encodeURIComponent(B.archive)}&path=${encodeURIComponent(path)}`);
+    B.path = d.path;
+    const parts = d.path ? d.path.split('/') : [];
+    const crumbs = [h('a', { onclick: () => browse('') }, 'root')];
+    parts.forEach((p, i) => crumbs.push(' / ', h('a', { onclick: () => browse(parts.slice(0, i + 1).join('/')) }, p)));
+    $('#crumbs').replaceChildren(...crumbs);
+    $('#entries').replaceChildren(...d.entries.map((e) => {
+      const full = (d.path ? d.path + '/' : '') + e.name;
+      return h('div', { class: 'entry' },
+        h('input', { type: 'checkbox', checked: B.selected.has(full), onchange: (ev) => { ev.target.checked ? B.selected.add(full) : B.selected.delete(full); updateRestoreHint(); } }),
+        e.type === 'd' ? h('a', { onclick: () => browse(full) }, e.name + '/') : e.name);
+    }));
+    updateRestoreHint();
+  } catch (e) { toast(e.message); }
+}
+function updateRestoreHint() { $('#restore-hint').textContent = B.selected.size ? `${B.selected.size} selected` : 'Tick files or folders to restore'; }
+$('#restore-btn').addEventListener('click', async () => {
+  if (!B.selected.size) return toast('Select something to restore first');
+  try { await api('api/restore', { archive: B.archive, paths: [...B.selected] }); showTab('overview'); poll(); } catch (e) { toast(e.message); }
+});
+
+poll();
+</script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+name: Storage Box Backup
+version: "0.1.0"
+slug: storagebox_backup
+description: Encrypted, versioned backups of your Home Assistant files to a Hetzner Storage Box (BorgBackup)
+url: https://github.com/AzezSalami/ha-storagebox-backup
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:cloud-upload
+panel_title: Storage Box
+homeassistant_api: true
+map:
+  - config:ro
+  - ssl:ro
+  - media:ro
+  - backup:ro
+  - share:rw
