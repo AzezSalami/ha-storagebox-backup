@@ -23,7 +23,7 @@ For Google Drive, OneDrive, Dropbox and similar, use *Advanced* with an `rclone:
 2. SFTP only: under **SSH key**, click *Install key* with the account password (used once, never stored),
    or add the shown public key to `authorized_keys` / your provider's panel yourself.
 3. Set an **encryption passphrase** and keep a copy outside Home Assistant. Without it backups cannot be restored.
-4. Choose folders, schedule and retention. **Save**.
+4. Tick the folders or files to back up in the built-in browser (any mounted folder: config, ssl, media, backup, share, addon_configs), then set schedule and retention. **Save**.
 5. **Test connection**, then **Initialize repository** (once).
 6. On Overview, click **Back up now**.
 

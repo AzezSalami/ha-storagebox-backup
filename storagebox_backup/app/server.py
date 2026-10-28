@@ -23,7 +23,7 @@ SETTINGS_FILE = os.path.join(DATA, "settings.json")
 STATE_FILE = os.path.join(DATA, "state.json")
 RESTORE_ROOT = os.environ.get("RESTORE_ROOT", "/share/remote-backup-restore")
 INGRESS_IP = "172.30.32.2"
-SOURCES = {"config": "/config", "ssl": "/ssl", "media": "/media", "backup": "/backup", "share": "/share"}
+ROOTS = ["/config", "/ssl", "/media", "/backup", "/share", "/addon_configs"]
 SNAPSHOT_RE = re.compile(r"[0-9a-f]{8,64}")
 BLOCKED_ENV = {"PATH", "SUPERVISOR_TOKEN", "RESTIC_PASSWORD", "RESTIC_CACHE_DIR"}
 
@@ -70,7 +70,7 @@ DEFAULTS = {
     "repository": "",
     "extra_env": "",
     "passphrase": "",
-    "sources": ["config"],
+    "sources": ["/config"],
     "excludes": [
         "home-assistant_v2.db*",
         "*.log",
@@ -113,6 +113,19 @@ def load_settings():
     if s["provider"] not in PROVIDERS:
         s["provider"] = "sftp"
     return s
+
+
+def under_root(p, real=False):
+    """Normalize p and return it if it lies inside a mounted root, else None."""
+    p = os.path.normpath("/" + str(p).strip().lstrip("/"))
+    for root in ROOTS:
+        if p == root or p.startswith(root + "/"):
+            if real:
+                rp, rr = os.path.realpath(p), os.path.realpath(root)
+                if not (rp == rr or rp.startswith(rr + os.sep)):
+                    return None
+            return p
+    return None
 
 
 def write_private(path, text):
@@ -171,7 +184,13 @@ def clean_settings(p, cur):
     if re.search(r"\s", s["s3_secret_key"]):
         raise ValueError("Invalid S3 secret key")
 
-    s["sources"] = [k for k in p.get("sources", s["sources"]) if k in SOURCES]
+    s["sources"] = []
+    for x in p.get("sources", cur["sources"]):
+        q = under_root(x)
+        if q is None:
+            raise ValueError(f"Not a mounted folder: {str(x)[:80]}")
+        if q not in s["sources"]:
+            s["sources"].append(q)
     s["excludes"] = [str(x).strip() for x in p.get("excludes", s["excludes"]) if str(x).strip()]
     s["compression"] = p.get("compression", s["compression"])
     if s["compression"] not in ("auto", "max", "off"):
@@ -429,9 +448,12 @@ def job_backup(job):
     s = load_settings()
     if not configured(s):
         return not_ready(job)
-    srcs = [SOURCES[k] for k in s["sources"] if os.path.isdir(SOURCES[k])]
+    srcs = [p for p in s["sources"] if os.path.exists(p)]
+    for p in s["sources"]:
+        if p not in srcs:
+            job.log(f"Skipping missing path: {p}")
     if not srcs:
-        job.log("No backup sources selected (or none are mounted).")
+        job.log("No backup sources selected (or none exist).")
         return False, "No sources selected"
     cmd = restic(s, "backup", "--tag", "homeassistant", "--host", "homeassistant",
                  "--compression", s["compression"], "--exclude-caches", "--exclude", RESTORE_ROOT)
@@ -532,9 +554,35 @@ def api_state():
         job=CURRENT.public() if CURRENT else None,
         history=st.get("history", [])[:15],
         next_run=next_run(s, st),
-        sources={k: os.path.isdir(v) for k, v in SOURCES.items()},
         restore_root=RESTORE_ROOT,
     )
+
+
+@app.get("/api/fs")
+def api_fs():
+    path = request.args.get("path", "")
+    if not path.strip("/"):
+        roots = [{"name": r.lstrip("/"), "path": r, "type": "d", "size": None} for r in ROOTS if os.path.isdir(r)]
+        return jsonify(path="", entries=roots)
+    p = under_root(path, real=True)
+    if p is None or not os.path.isdir(p):
+        return jsonify(error="Not a mounted folder"), 400
+    entries = []
+    try:
+        with os.scandir(p) as it:
+            for e in it:
+                if len(entries) >= 3000:
+                    break
+                try:
+                    is_dir = e.is_dir(follow_symlinks=False)
+                    size = None if is_dir else e.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+                entries.append({"name": e.name, "path": f"{p}/{e.name}", "type": "d" if is_dir else "f", "size": size})
+    except OSError as err:
+        return jsonify(error=str(err)), 500
+    entries.sort(key=lambda e: (e["type"] != "d", e["name"].lower()))
+    return jsonify(path=p, entries=entries)
 
 
 @app.get("/api/log")

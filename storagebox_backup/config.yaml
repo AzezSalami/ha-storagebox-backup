@@ -16,6 +16,7 @@ panel_title: Remote Backup
 homeassistant_api: true
 map:
   - config:ro
+  - addon_configs:ro
   - ssl:ro
   - media:ro
   - backup:ro

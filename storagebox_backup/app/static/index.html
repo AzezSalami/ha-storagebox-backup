@@ -156,7 +156,11 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 
     <div class="card">
       <h2>4. What to back up</h2>
-      <div id="sources"></div>
+      <label>Selected (<span id="sel-count">0</span>)</label>
+      <div id="sel-list"></div>
+      <label>Browse and tick the folders or files to include</label>
+      <div class="crumbs" id="fs-crumbs"></div>
+      <div id="fs-entries" style="max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:8px"></div>
       <label>Exclude patterns (one per line)</label>
       <textarea id="f-excludes" rows="6"></textarea>
       <div class="hint">The Home Assistant database is excluded by default: it is large, constantly changing and may be inconsistent while running. Remove the first line to include it.</div>
@@ -286,7 +290,6 @@ async function poll() { try { await Promise.all([loadState(), loadLog()]); } cat
 setInterval(poll, 2000);
 
 // ---- settings form
-const SRC_LABELS = { config: 'Home Assistant config (/config)', ssl: 'SSL certificates (/ssl)', media: 'Media (/media)', backup: 'Home Assistant backups (/backup)', share: 'Share (/share)' };
 const provType = () => STATE.providers[$('#f-provider').value].type;
 function syncProvider(changed) {
   const p = STATE.providers[$('#f-provider').value];
@@ -323,10 +326,41 @@ function fillForm() {
   $('#f-notify').checked = s.notify_failure;
   $('#pubkey').value = STATE.pubkey;
   $('#pass-hint').textContent = s.passphrase_set ? 'A passphrase is saved. Leave empty to keep it.' : 'No passphrase set yet.';
-  $('#sources').replaceChildren(...Object.keys(SRC_LABELS).map((k) => h('label', { class: 'check' },
-    h('input', { type: 'checkbox', id: 'src-' + k, checked: s.sources.includes(k), disabled: !STATE.sources[k] }),
-    SRC_LABELS[k] + (STATE.sources[k] ? '' : ' - not mounted'))));
+  SEL = new Set(s.sources);
+  renderSel();
+  fsBrowse('');
   syncMode();
+}
+
+// ---- source picker
+let SEL = new Set();
+const covered = (p) => [...SEL].some((q) => p.startsWith(q + '/'));
+function renderSel() {
+  $('#sel-count').textContent = SEL.size;
+  $('#sel-list').replaceChildren(...(SEL.size ? [...SEL].sort() : [h('div', { class: 'hint' }, 'Nothing selected')]).map((p) =>
+    SEL.size ? h('div', { class: 'entry' }, h('code', { style: 'flex:1' }, p),
+      h('button', { class: 'btn', onclick: () => { SEL.delete(p); renderSel(); fsBrowse(FSPATH); } }, 'Remove')) : p));
+}
+let FSPATH = '';
+async function fsBrowse(path) {
+  try {
+    const d = await api('api/fs?path=' + encodeURIComponent(path));
+    FSPATH = d.path;
+    const parts = d.path ? d.path.split('/').filter(Boolean) : [];
+    const crumbs = [h('a', { onclick: () => fsBrowse('') }, 'mounted folders')];
+    parts.forEach((p, i) => crumbs.push(' / ', h('a', { onclick: () => fsBrowse('/' + parts.slice(0, i + 1).join('/')) }, p)));
+    $('#fs-crumbs').replaceChildren(...crumbs);
+    $('#fs-entries').replaceChildren(...d.entries.map((e) => {
+      const inherited = covered(e.path);
+      return h('div', { class: 'entry' },
+        h('input', {
+          type: 'checkbox', checked: SEL.has(e.path) || inherited, disabled: inherited,
+          onchange: (ev) => { ev.target.checked ? SEL.add(e.path) : SEL.delete(e.path); renderSel(); fsBrowse(FSPATH); },
+        }),
+        e.type === 'd' ? h('a', { onclick: () => fsBrowse(e.path) }, e.name + '/') : e.name,
+        h('span', { class: 'hint', style: 'margin-left:auto' }, inherited ? 'included via parent' : fmtSize(e.size) === '-' ? '' : fmtSize(e.size)));
+    }));
+  } catch (e) { toast(e.message); }
 }
 function syncMode() {
   const daily = $('#f-sch-mode').value === 'daily';
@@ -343,7 +377,7 @@ $('#save').addEventListener('click', async () => {
     s3_endpoint: $('#f-s3_endpoint').value, s3_bucket: $('#f-s3_bucket').value, s3_region: $('#f-s3_region').value,
     s3_access_key: $('#f-s3_access_key').value, s3_secret_key: $('#f-s3_secret_key').value,
     repository: $('#f-repository').value, extra_env: $('#f-extra_env').value,
-    sources: Object.keys(SRC_LABELS).filter((k) => $('#src-' + k)?.checked),
+    sources: [...SEL],
     excludes: $('#f-excludes').value.split('\n'),
     compression: $('#f-compression').value,
     schedule: { enabled: $('#f-sch-enabled').checked, mode: $('#f-sch-mode').value, time: $('#f-sch-time').value, every_hours: $('#f-sch-hours').value },
