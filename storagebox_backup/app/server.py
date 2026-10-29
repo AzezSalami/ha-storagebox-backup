@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
-VERSION = "0.3.0"
+VERSION = "1.0.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("DATA_DIR", "/data")
 SSH_DIR = os.path.join(DATA, "ssh")
@@ -239,15 +239,20 @@ def ptype(s):
     return PROVIDERS[s["provider"]]["type"]
 
 
-def configured(s):
-    if not s["passphrase"]:
-        return False
+def missing_fields(s):
+    need = {"passphrase": "Encryption passphrase"}
     t = ptype(s)
     if t == "sftp":
-        return bool(s["host"] and s["user"] and s["path"] and s["port"])
-    if t == "s3":
-        return bool(s["s3_endpoint"] and s["s3_bucket"] and s["s3_access_key"] and s["s3_secret_key"])
-    return bool(s["repository"])
+        need.update(host="Host", user="Username", port="SSH port", path="Folder on server")
+    elif t == "s3":
+        need.update(s3_endpoint="Endpoint", s3_bucket="Bucket", s3_access_key="Access key", s3_secret_key="Secret key")
+    else:
+        need["repository"] = "Restic repository"
+    return [label for key, label in need.items() if not s[key]]
+
+
+def configured(s):
+    return not missing_fields(s)
 
 
 # ---------------------------------------------------------------- ssh / restic plumbing
@@ -421,8 +426,8 @@ HINTS = [
      "The server did not answer. Check the port, that SSH/SFTP is enabled at your provider, and that no firewall blocks it."),
     (r"Connection refused", "fail",
      "Nothing is listening on this port. Check the port number and that SSH/SFTP is enabled at your provider."),
-    (r"Permission denied \((publickey|password|keyboard)|Too many authentication failures|no supported authentication", "fail",
-     "The server rejected the SSH key. Install the public key (Settings > SSH key) and check the username."),
+    (r"Permission denied \(|subprocess ssh:.*Permission denied|Too many authentication failures|no supported authentication", "fail",
+     "The server rejected the SSH key. Install the public key (Settings > SSH key > Install key) and check the username."),
     (r"sftp connections only|shell access is disabled", "warn",
      "Shell commands are disabled on this account (normal for SFTP-only accounts). Backups can still work."),
     (r"subsystem request failed", "fail",
@@ -477,8 +482,8 @@ def job_test(job):
         return all(x["status"] != "fail" for x in steps), summary
 
     if not configured(s):
-        step("Settings", "fail", "The destination or passphrase is incomplete",
-             "Fill in every field for this provider, set a passphrase and press Save.")
+        step("Settings", "fail", "Missing: " + ", ".join(missing_fields(s)),
+             "Fill in these fields and press 'Save settings' (the check uses the saved values, not the form).")
         return finish("Not configured")
 
     host, port = net_target(s)

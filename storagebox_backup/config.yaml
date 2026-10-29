@@ -1,5 +1,5 @@
 name: Remote Backup
-version: "0.3.0"
+version: "1.0.0"
 slug: storagebox_backup
 description: Encrypted, versioned backups of your Home Assistant files to Hetzner, Hostinger, any SFTP/SSH server or S3 storage (restic)
 url: https://github.com/AzezSalami/ha-storagebox-backup
