@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("DATA_DIR", "/data")
 SSH_DIR = os.path.join(DATA, "ssh")
@@ -23,6 +23,7 @@ KEY = os.path.join(SSH_DIR, "id_ed25519")
 KNOWN_HOSTS = os.path.join(SSH_DIR, "known_hosts")
 SETTINGS_FILE = os.path.join(DATA, "settings.json")
 STATE_FILE = os.path.join(DATA, "state.json")
+LOG_DIR = os.path.join(DATA, "logs")
 RESTORE_ROOT = os.environ.get("RESTORE_ROOT", "/share/remote-backup-restore")
 INGRESS_IP = "172.30.32.2"
 ROOTS = ["/config", "/ssl", "/media", "/backup", "/share", "/addon_configs"]
@@ -389,6 +390,24 @@ def start_job(kind, fn, trigger="manual"):
     return job
 
 
+def save_log(job):
+    lines = job.lines
+    if len(lines) > 5000:
+        lines = [f"... {len(lines) - 5000} earlier lines omitted ..."] + lines[-5000:]
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        write_private(os.path.join(LOG_DIR, f"{job.id}.log"), "\n".join(lines) + "\n")
+    except OSError as e:
+        print("could not save log:", e)
+
+
+def drop_log(job_id):
+    try:
+        os.remove(os.path.join(LOG_DIR, f"{job_id}.log"))
+    except OSError:
+        pass
+
+
 def run_job(job, fn):
     global CURRENT, LAST
     try:
@@ -398,9 +417,12 @@ def run_job(job, fn):
         ok, summary = False, f"Internal error: {e}"
     job.end, job.ok, job.summary = time.time(), ok, summary
     entry = job.public()
+    save_log(job)
 
     def add(st):
         st.setdefault("history", []).insert(0, entry)
+        for old in st["history"][50:]:
+            drop_log(old["id"])
         del st["history"][50:]
 
     update_state(add)
@@ -728,6 +750,17 @@ def api_log():
         since = 0
     lines = job.lines[since:]
     return jsonify(job_id=str(job.id), running=job is CURRENT, lines=lines, next=since + len(lines))
+
+
+@app.get("/api/history/<int:job_id>/log")
+def api_history_log(job_id):
+    if not any(x["id"] == job_id for x in load_state().get("history", [])):
+        return jsonify(error="Unknown history entry"), 404
+    try:
+        with open(os.path.join(LOG_DIR, f"{job_id}.log"), errors="replace") as f:
+            return jsonify(text=f.read())
+    except OSError:
+        return jsonify(error="No log was saved for this entry"), 404
 
 
 @app.post("/api/settings")

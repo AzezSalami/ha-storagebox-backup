@@ -55,6 +55,10 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .crumbs { margin-bottom: 8px; font-size: 13px; }
 .crumbs a { color: var(--accent); cursor: pointer; }
 .hidden { display: none; }
+.modal { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 8; }
+.modal.hidden { display: none; }
+.modal-card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; width: 100%; max-width: 900px; }
+#modal-log { background: var(--log); color: var(--log-text); padding: 12px; border-radius: 8px; max-height: 65vh; overflow: auto; margin: 0; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 8px; z-index: 9; }
 </style>
 </head>
@@ -90,7 +94,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
     </div>
     <div class="card"><h2>Activity log</h2><pre id="log">Nothing has run yet.</pre></div>
     <div class="card"><h2>History</h2>
-      <table><thead><tr><th>When</th><th>Job</th><th>Duration</th><th>Result</th><th>Details</th></tr></thead><tbody id="history"></tbody></table>
+      <table><thead><tr><th>When</th><th>Job</th><th>Duration</th><th>Result</th><th>Details</th><th></th></tr></thead><tbody id="history"></tbody></table>
     </div>
   </section>
 
@@ -203,6 +207,16 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
   </section>
 </main>
 
+<div class="modal hidden" id="modal">
+  <div class="modal-card">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <h2 id="modal-title" style="margin:0"></h2>
+      <div class="row"><button class="btn" id="modal-copy">Copy</button><button class="btn" id="modal-close">Close</button></div>
+    </div>
+    <pre id="modal-log"></pre>
+  </div>
+</div>
+
 <script>
 const $ = (s) => document.querySelector(s);
 function h(tag, props = {}, ...kids) {
@@ -279,17 +293,40 @@ async function loadState() {
   const lastBackup = s.history.find((x) => x.kind === 'backup' && x.ok);
   $('#s-last').textContent = lastBackup ? fmtTime(lastBackup.end) : 'never';
   $('#s-next').textContent = s.next_run ? fmtTime(s.next_run) : 'off';
-  const tb = $('#history');
-  tb.replaceChildren(...s.history.map((x) => h('tr', {},
-    h('td', {}, fmtTime(x.start)), h('td', {}, x.kind + (x.trigger === 'schedule' ? ' (sched)' : '')),
-    h('td', {}, fmtDuration(x.end ? x.end - x.start : null)),
-    h('td', {}, x.ok == null ? '' : h('span', { class: 'pill ' + (x.ok ? 'ok' : 'bad') }, x.ok ? 'OK' : 'Failed')),
-    h('td', {}, x.summary))));
+  const hk = JSON.stringify(s.history);
+  if (hk !== histKey) {
+    histKey = hk;
+    $('#history').replaceChildren(...s.history.map((x) => h('tr', {},
+      h('td', {}, fmtTime(x.start)), h('td', {}, x.kind + (x.trigger === 'schedule' ? ' (sched)' : '')),
+      h('td', {}, fmtDuration(x.end ? x.end - x.start : null)),
+      h('td', {}, x.ok == null ? '' : h('span', { class: 'pill ' + (x.ok ? 'ok' : 'bad') }, x.ok ? 'OK' : 'Failed')),
+      h('td', {}, x.summary),
+      h('td', {}, h('button', { class: 'btn', onclick: () => showLog(x) }, 'Log')))));
+  }
   $('#restore-root').textContent = s.restore_root;
   renderCheck();
   if (!formLoaded) fillForm();
   if (!s.job && !repoLoaded) { repoLoaded = true; loadRepo(); }
 }
+
+// ---- history log viewer
+let histKey = null;
+async function showLog(entry) {
+  try {
+    const d = await api(`api/history/${entry.id}/log`);
+    $('#modal-title').textContent = `${entry.kind} - ${fmtTime(entry.start)}`;
+    $('#modal-log').textContent = d.text;
+    $('#modal').classList.remove('hidden');
+    $('#modal-log').scrollTop = $('#modal-log').scrollHeight;
+  } catch (e) { toast(e.message); }
+}
+const closeModal = () => $('#modal').classList.add('hidden');
+$('#modal-close').addEventListener('click', closeModal);
+$('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') closeModal(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+$('#modal-copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText($('#modal-log').textContent); toast('Copied'); } catch { toast('Select the text and copy it manually'); }
+});
 
 // ---- connection check
 let checkKey = null;
