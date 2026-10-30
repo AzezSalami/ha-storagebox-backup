@@ -1,0 +1,57 @@
+name: Check for updates
+
+# Home Assistant only offers an add-on update when the version number goes up.
+# Every day this checks whether the base image or the Alpine packages the
+# add-on installs (restic, openssh, ...) have changed. Only then is the patch
+# version bumped, so users with auto update on get a rebuild with the fixes.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect current base image digests and package versions
+        run: |
+          {
+            for arch in amd64 aarch64; do
+              img=$(sed -n "s|^ *$arch: *||p" storagebox_backup/build.yaml)
+              echo "$arch $img $(docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}')"
+            done
+            img=$(sed -n 's|^ *amd64: *||p' storagebox_backup/build.yaml)
+            docker run --rm --entrypoint sh "$img" -c \
+              'apk update -q >/dev/null && apk search -e -v restic rclone openssh-client sshpass python3 py3-flask tzdata' | sort
+          } > "$RUNNER_TEMP/state.txt"
+          cat "$RUNNER_TEMP/state.txt"
+
+      - name: Bump version if anything changed
+        run: |
+          state=.github/rebuild-state.txt
+          if [ -f "$state" ]; then
+            if diff "$state" "$RUNNER_TEMP/state.txt"; then
+              echo "Nothing changed, no new version."
+              exit 0
+            fi
+            cur=$(sed -n 's/^version: "\(.*\)"/\1/p' storagebox_backup/config.yaml)
+            IFS=. read -r major minor patch <<< "$cur"
+            new="$major.$minor.$((patch + 1))"
+            sed -i "s/^version: \".*\"/version: \"$new\"/" storagebox_backup/config.yaml
+            sed -i "s/^VERSION = \".*\"/VERSION = \"$new\"/" storagebox_backup/app/server.py
+            echo "Bumped $cur -> $new"
+          else
+            echo "First run: recording the current state without a new version."
+          fi
+          cp "$RUNNER_TEMP/state.txt" "$state"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Rebuild to pick up base image and package updates"
+          git push
