@@ -90,7 +90,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
     </div>
     <div class="card"><h2>Activity log</h2><pre id="log">Nothing has run yet.</pre></div>
     <div class="card"><h2>History</h2>
-      <table><thead><tr><th>When</th><th>Job</th><th>Result</th><th>Details</th></tr></thead><tbody id="history"></tbody></table>
+      <table><thead><tr><th>When</th><th>Job</th><th>Duration</th><th>Result</th><th>Details</th></tr></thead><tbody id="history"></tbody></table>
     </div>
   </section>
 
@@ -229,6 +229,13 @@ function toast(msg) {
   setTimeout(() => t.remove(), 3500);
 }
 const fmtTime = (ts) => ts ? new Date(ts * 1000).toLocaleString() : '-';
+function fmtDuration(sec) {
+  if (sec == null) return '-';
+  sec = Math.round(sec);
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';
+  return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
+}
 const fmtSize = (n) => {
   if (n == null) return '-';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -275,6 +282,7 @@ async function loadState() {
   const tb = $('#history');
   tb.replaceChildren(...s.history.map((x) => h('tr', {},
     h('td', {}, fmtTime(x.start)), h('td', {}, x.kind + (x.trigger === 'schedule' ? ' (sched)' : '')),
+    h('td', {}, fmtDuration(x.end ? x.end - x.start : null)),
     h('td', {}, x.ok == null ? '' : h('span', { class: 'pill ' + (x.ok ? 'ok' : 'bad') }, x.ok ? 'OK' : 'Failed')),
     h('td', {}, x.summary))));
   $('#restore-root').textContent = s.restore_root;

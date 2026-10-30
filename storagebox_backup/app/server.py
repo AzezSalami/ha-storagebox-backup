@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("DATA_DIR", "/data")
 SSH_DIR = os.path.join(DATA, "ssh")
