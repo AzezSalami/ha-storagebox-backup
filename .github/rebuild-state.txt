@@ -1,0 +1,10 @@
+amd64 ghcr.io/home-assistant/amd64-base:3.20 sha256:e708939c821ba8410fc29204525b85d2c5abb51b73e874482e65a3c38155bd20
+aarch64 ghcr.io/home-assistant/aarch64-base:3.20 sha256:ced4e7a9c46bee9ee964698d0c9d6a7c81f81754ed9d6b398007ab4092e17a30
+openssh-client-default-9.7_p1-r5 - OpenBSD's SSH client
+openssh-client-krb5-9.7_p1-r5 - OpenBSD's SSH client with kerberos support
+py3-flask-3.0.3-r0 - web development microframework
+python3-3.12.13-r0 - High-level scripting language
+rclone-1.66.0-r5 - Rsync for cloud storage
+restic-0.16.4-r5 - Fast, secure, efficient backup program
+sshpass-1.10-r0 - Non-interactive SSH authentication utility
+tzdata-2026b-r0 - Timezone data
