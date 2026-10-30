@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("DATA_DIR", "/data")
 SSH_DIR = os.path.join(DATA, "ssh")
@@ -438,7 +438,7 @@ HINTS = [
      "The storage rejected the credentials. Check the access key, secret key and the key's permissions on the bucket."),
     (r"NoSuchBucket", "fail", "The bucket does not exist. Check the bucket name, endpoint and region."),
     (r"already locked|unable to create lock", "fail",
-     "Another backup holds a lock on the repository, or one crashed. Wait for it to finish, or remove stale locks with 'restic unlock'."),
+     "Another backup holds a lock on the repository, or one crashed. Wait for it to finish, or press 'Unlock repository' to remove stale locks."),
     (r"Is there a repository at the following location|unable to open config file|repository does not exist|file does not exist|no such file or directory", "warn",
      "No repository exists at this location yet. If this is your first setup press 'Initialize repository'; otherwise check the folder path."),
     (r"Permission denied", "fail",
@@ -535,6 +535,19 @@ def job_init(job):
     return rc == 0, "Repository initialized" if rc == 0 else f"restic init failed (exit {rc})"
 
 
+def unlock(job, s):
+    """Remove stale locks left behind by an interrupted job (live locks are kept)."""
+    return job.run(restic(s, "unlock"), restic_env(s))
+
+
+def job_unlock(job):
+    s = load_settings()
+    if not configured(s):
+        return not_ready(job)
+    rc = unlock(job, s)
+    return rc == 0, "Stale locks removed" if rc == 0 else f"restic unlock failed (exit {rc})"
+
+
 def prune(job, s):
     r = s["retention"]
     keep = []
@@ -560,6 +573,7 @@ def job_backup(job):
     if not srcs:
         job.log("No backup sources selected (or none exist).")
         return False, "No sources selected"
+    unlock(job, s)
     cmd = restic(s, "backup", "--tag", "homeassistant", "--host", "homeassistant",
                  "--compression", s["compression"], "--exclude-caches", "--exclude", RESTORE_ROOT)
     for pat in s["excludes"]:
@@ -578,6 +592,7 @@ def job_prune(job):
     s = load_settings()
     if not configured(s):
         return not_ready(job)
+    unlock(job, s)
     rc = prune(job, s)
     return rc == 0, "Pruned old snapshots" if rc == 0 else f"restic forget failed (exit {rc})"
 
@@ -760,7 +775,7 @@ def api_key_install():
 
 @app.post("/api/job/<kind>")
 def api_job(kind):
-    fns = {"test": job_test, "init": job_init, "backup": job_backup, "prune": job_prune}
+    fns = {"test": job_test, "init": job_init, "backup": job_backup, "prune": job_prune, "unlock": job_unlock}
     if kind not in fns:
         abort(404)
     job = start_job(kind, fns[kind])
